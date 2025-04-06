@@ -190,9 +190,19 @@ func ListenListen(proto uint8, addr1 string, addr2 string) {
     LogInfo("listen B point with sock2 [%s]", addr2)
     go sockfoo(addr2, clientc2, quit2)
 
+    // set "pause" channel
+    // "pause channel" implements alternating processing of socket1 and socket2
+    // to cope with high concurrent requests on one side; when there are multiple
+    // sockets waiting to be processed on one side, each socket only provides
+    // 1 second to wait for the socket on the other side.
+    pausech := make(chan Conn)
+    clientch1 := clientc1
+    clientch2 := clientc2
+
     var sock1 Conn = nil
     var sock2 Conn = nil
     var count int = 1
+    var timeout int = 0
     for {
         select {
         case <-stop:
@@ -200,7 +210,7 @@ func ListenListen(proto uint8, addr1 string, addr2 string) {
             quit2 <- true
             release(sock1, sock2)
             return
-        case c1 := <-clientc1:
+        case c1 := <-clientch1:
             if c1 == nil {
                 // set stop flag when error happend
                 stop <- true
@@ -212,7 +222,7 @@ func ListenListen(proto uint8, addr1 string, addr2 string) {
             }
             sock1 = c1
             LogInfo("A point(link%d) [%s] is ready", count, sock1.RemoteAddr())
-        case c2 := <-clientc2:
+        case c2 := <-clientch2:
             if c2 == nil {
                 // set stop flag when error happend
                 stop <- true
@@ -224,28 +234,49 @@ func ListenListen(proto uint8, addr1 string, addr2 string) {
             }
             sock2 = c2
             LogInfo("B point(link%d) [%s] is ready", count, sock2.RemoteAddr())
-        case <-time.After(120 * time.Second):
+        case <-time.After(1 * time.Second):
+            // resume socket1 && socket2 channel
+            timeout = timeout + 1
+            clientch1 = clientc1
+            clientch2 = clientc2
+            if timeout < 120 {
+                continue
+            }
+
+            // the timeout for a single socket is "timeout * time.Second"
             if sock1 != nil {
                 LogWarn("A point(%s) socket wait timeout, reset", sock1.RemoteAddr())
             }
             if sock2 != nil {
                 LogWarn("B point(%s) socket wait timeout, reset", sock2.RemoteAddr())
             }
+            // release and reset
             release(sock1, sock2)
+            sock1 = nil
+            sock2 = nil
+            timeout = 0
             continue
         }
 
-        // wait another socket ready
-        if sock1 == nil || sock2 == nil {
+        // sock1 or sock2 is ready, wait another socket ready
+        // and set self channel to "pause", sock1 and sock2 are processed alternately for paired
+        if sock1 == nil {
+            clientch2 = pausech
+            continue
+        }
+        if sock2 == nil {
+            clientch1 = pausech
             continue
         }
 
         // the two socket is ready, connect with sockets
         go ConnectSock(count, sock1, sock2)
         count += 1
-        // reset sock1 & sock2
+        // reset sock1 & sock2 & clientc1 & clientc2
         sock1 = nil
+        clientch1 = clientc1
         sock2 = nil
+        clientch2 = clientc2
     } // end for
 }
 
